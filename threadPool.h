@@ -1,10 +1,9 @@
 #ifndef THREADPOOL_H
 #define THREADPOOL_H
 /*
-- V1.1
+- V2
 + Improvements in Memory ordering and performance
 + Reduced Memory Usage
-
 
  -- Github: cppLawyer -- 
 
@@ -20,7 +19,6 @@
 
 /*****************************************************************************************/
 
-#include <iostream>
 #include <thread>
 #include <vector>
 #include <functional>
@@ -38,13 +36,11 @@ class threadpool {
 public:
 	threadpool() noexcept {
 		stop.store(false, std::memory_order_relaxed);
-		std::cout << total_threads;
 		pool.reserve(this->total_threads);
 		pool.push_back(std::move(std::thread([&]() {
-			do {
-				while (!(this->stop.load(std::memory_order_acquire)) && this->task_queue.empty() && this->pool.size() == 1) {
+			 do {
+				while (!(this->stop.load(std::memory_order_acquire)) && this->task_queue.empty() && this->pool.size() == 1)
 					std::this_thread::yield();
-				}
 
 				if (!this->task_queue.empty() && this->pool.size() != this->total_threads) {
 					this->pool.push_back(std::move(std::thread(std::move(this->task_queue.front()))));
@@ -56,10 +52,8 @@ public:
 						this->pool.erase(this->pool.begin() + 1, this->pool.begin() + 2);
 					}
 				}
-
-
-			} while (!(this->stop.load(std::memory_order_relaxed)) || !this->task_queue.empty() || this->pool.size() != 1); })));
-
+			    } while (!(this->stop.load(std::memory_order_relaxed)) || !this->task_queue.empty() || this->pool.size() != 1); 
+			})));
 	}
 
 
@@ -70,9 +64,8 @@ public:
 	inline void stop_pool() noexcept {
 		//manually stop the threadpool
 		this->stop.store(true, std::memory_order_release);
-		if (pool[0].joinable()) {
+		if (pool[0].joinable())
 			pool[0].join();
-		}
 	}
 
 	inline void reset_and_restart() noexcept {
@@ -80,11 +73,10 @@ public:
 		pool.clear();
 		stop.store(false, std::memory_order_relaxed);
 		pool.push_back(std::move(std::thread([&]() {
-
 			do {
-				while (!(this->stop.load(std::memory_order_acquire)) && this->task_queue.empty() && this->pool.size() == 1) {
+				while (!(this->stop.load(std::memory_order_acquire)) && this->task_queue.empty() && this->pool.size() == 1)
 					std::this_thread::yield(); //Reschedule thread to do other task// best is to avoid this by using stop
-				}
+				
 				if (!this->task_queue.empty() && this->pool.size() != this->total_threads) {
 					this->pool.push_back(std::move(std::thread(std::move(this->task_queue.front()))));
 					this->task_queue.pop();
@@ -96,21 +88,15 @@ public:
 					}
 				}
 				//memory order relaxed because of the acquire above thread have same view...//
-			} while (!(this->stop.load(std::memory_order_relaxed)) || !this->task_queue.empty() || this->pool.size() != 1); })));
-
-
+			} while (!(this->stop.load(std::memory_order_relaxed)) || !this->task_queue.empty() || this->pool.size() != 1); 
+		})));
 	}
 	~threadpool() noexcept {
-		if (!stop.load(std::memory_order_consume)) {
-			stop.store(true, std::memory_order_relaxed);
-			//automatic stop
-		}
-		if (pool[0].joinable()) {
-			pool[0].detach();
-		}
-
+		if (!stop.load(std::memory_order_consume))
+			stop.store(true, std::memory_order_relaxed); //automatic stop
+		if (pool[0].joinable())
+			pool[0].detach();	
 	}
-
 };
 
 #endif
