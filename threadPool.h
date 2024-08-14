@@ -1,7 +1,7 @@
 #ifndef THREADPOOL_H
 #define THREADPOOL_H
 /*
-- V2
+- V3.0
 + Improvements in Memory ordering and performance
 + Reduced Memory Usage
 
@@ -24,82 +24,131 @@
 #include <functional>
 #include <queue>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <memory>
+#include <future>
 #include <cassert>
 
+constexpr size_t CACHE_LINE_SIZE = 64;
 
+template<typename T>
+class LockFreeQueue {
+    struct Node {
+        std::shared_ptr<T> data;
+        std::atomic<Node*> next{nullptr};
+    };
 
-class threadpool {
-	const uint_fast8_t total_threads = std::thread::hardware_concurrency();
-	std::vector<std::thread> pool;
-	std::queue<std::function<void()>> task_queue;
-	std::atomic<bool> stop;
+    alignas(CACHE_LINE_SIZE) std::atomic<Node*> head;
+    alignas(CACHE_LINE_SIZE) std::atomic<Node*> tail;
+    std::atomic<size_t> size{0};
+
 public:
-	threadpool() noexcept {
-		stop.store(false, std::memory_order_relaxed);
-		pool.reserve(this->total_threads);
-		pool.push_back(std::move(std::thread([&]() {
-			 do {
-				while (!(this->stop.load(std::memory_order_acquire)) && this->task_queue.empty() && this->pool.size() == 1)
-					std::this_thread::yield();
+    LockFreeQueue() {
+        Node* dummy = new Node();
+        head.store(dummy, std::memory_order_relaxed);
+        tail.store(dummy, std::memory_order_relaxed);
+    }
 
-				if (!this->task_queue.empty() && this->pool.size() != this->total_threads) {
-					this->pool.push_back(std::move(std::thread(std::move(this->task_queue.front()))));
-					this->task_queue.pop();
-				}
-				else {
-					if (this->pool[1].joinable()) {
-						this->pool[1].join();
-						this->pool.erase(this->pool.begin() + 1, this->pool.begin() + 2);
-					}
-				}
-			    } while (!(this->stop.load(std::memory_order_relaxed)) || !this->task_queue.empty() || this->pool.size() != 1); 
-			})));
-	}
+    ~LockFreeQueue() {
+        while (Node* old_head = head.load(std::memory_order_relaxed)) {
+            head.store(old_head->next, std::memory_order_relaxed);
+            delete old_head;
+        }
+    }
 
+    void push(const T& value) {
+        Node* new_tail = new Node();
+        new_tail->data = std::make_shared<T>(value);
+        Node* old_tail = tail.load(std::memory_order_relaxed);
+        old_tail->next.store(new_tail, std::memory_order_release);
+        tail.store(new_tail, std::memory_order_relaxed);
+        size.fetch_add(1, std::memory_order_relaxed);
+    }
 
-	inline void push(std::function<void()>&& f1) noexcept {
-		task_queue.push(std::move(f1));
-	}
+    bool pop(T& result) {
+        Node* old_head = head.load(std::memory_order_relaxed);
+        Node* new_head = old_head->next.load(std::memory_order_acquire);
 
-	inline void stop_pool() noexcept {
-		//manually stop the threadpool
-		this->stop.store(true, std::memory_order_release);
-		if (pool[0].joinable())
-			pool[0].join();
-	}
+        if (!new_head) return false;
 
-	inline void reset_and_restart() noexcept {
-		assert(!(pool[0].joinable())); //"Call stop_pool() before the reset_and_restart()"
-		pool.clear();
-		stop.store(false, std::memory_order_relaxed);
-		pool.push_back(std::move(std::thread([&]() {
-			do {
-				while (!(this->stop.load(std::memory_order_acquire)) && this->task_queue.empty() && this->pool.size() == 1)
-					std::this_thread::yield(); //Reschedule thread to do other task// best is to avoid this by using stop
-				
-				if (!this->task_queue.empty() && this->pool.size() != this->total_threads) {
-					this->pool.push_back(std::move(std::thread(std::move(this->task_queue.front()))));
-					this->task_queue.pop();
-				}
-				else {
-					if (this->pool[1].joinable()) {
-						this->pool[1].join();
-						this->pool.erase(this->pool.begin() + 1, this->pool.begin() + 2);
-					}
-				}
-				//memory order relaxed because of the acquire above thread have same view...//
-			} while (!(this->stop.load(std::memory_order_relaxed)) || !this->task_queue.empty() || this->pool.size() != 1); 
-		})));
-	}
-	~threadpool() noexcept {
-		if (!stop.load(std::memory_order_consume))
-			stop.store(true, std::memory_order_relaxed); //automatic stop
-		if (pool[0].joinable())
-			pool[0].detach();	
-	}
+        result = std::move(*new_head->data);
+        head.store(new_head, std::memory_order_relaxed);
+        delete old_head;
+        size.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool empty() const noexcept {
+        return size.load(std::memory_order_relaxed) == 0;
+    }
 };
 
-#endif
+class ThreadPool {
+    using Task = std::function<void()>;
 
+    std::vector<std::thread> workers;
+    std::vector<LockFreeQueue<Task>> task_queues;
+    std::atomic<bool> stop{false};
+    alignas(CACHE_LINE_SIZE) std::atomic<size_t> index{0};
 
-	
+    void worker_thread(size_t i) {
+        while (!stop.load(std::memory_order_acquire)) {
+            Task task;
+            bool found_task = false;
+
+            for (size_t n = 0; n < task_queues.size(); ++n) {
+                if (task_queues[(i + n) % task_queues.size()].pop(task)) {
+                    found_task = true;
+                    break;
+                }
+            }
+
+            if (found_task) {
+                task();
+            } else {
+                std::this_thread::yield(); // Avoid busy-waiting
+            }
+        }
+    }
+
+public:
+    explicit ThreadPool(size_t num_threads = std::thread::hardware_concurrency())
+        : task_queues(num_threads) {
+        workers.reserve(num_threads);
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this, i] { worker_thread(i); });
+        }
+    }
+
+    template <typename F, typename... Args>
+    auto submit(F&& f, Args&&... args) -> std::future<typename std::invoke_result<F, Args...>::type> {
+        using ReturnType = typename std::invoke_result<F, Args...>::type;
+
+        auto task = std::make_shared<std::packaged_task<ReturnType()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+
+        std::future<ReturnType> result = task->get_future();
+        size_t i = index.fetch_add(1, std::memory_order_relaxed) % task_queues.size();
+        task_queues[i].push([task]() { (*task)(); });
+
+        return result;
+    }
+
+    void shutdown() noexcept {
+        stop.store(true, std::memory_order_release);
+        for (auto& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    ~ThreadPool() noexcept {
+        shutdown();
+    }
+};
+
+#endif // THREADPOOL_H
+
